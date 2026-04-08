@@ -25,10 +25,12 @@ static const char *TAG = "XPT2046";
 #define XPT2046_CMD_X       0x91  /* X position */
 #define XPT2046_CMD_Y_PD0   0xD1  /* Y position, pen down */
 #define XPT2046_CMD_Y_PD1   0xD0  /* Y position, power down */
-
-#define XPT2046_SAMPLES         CONFIG_LCD_TOUCH_XPT2046_SAMPLES
-#define XPT2046_Z_THRESHOLD     CONFIG_LCD_TOUCH_XPT2046_Z_THRESHOLD
-
+#ifndef XPT2046_SAMPLES
+#define XPT2046_SAMPLES         3
+#endif
+#ifndef XPT2046_Z_THRESHOLD
+#define XPT2046_Z_THRESHOLD     400
+#endif
 typedef struct {
     spi_device_handle_t spi_dev;
     esp_lcd_touch_config_t config;

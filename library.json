@@ -1,6 +1,6 @@
 {
     "name": "htcw_esp_lcd_touch_xpt2046",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "The XPT2046 touch component from the espressif registry packaged for PIO",
     "keywords": ["touch","input"],
     "authors": {
