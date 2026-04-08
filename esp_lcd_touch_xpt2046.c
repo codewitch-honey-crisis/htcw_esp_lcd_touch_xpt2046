@@ -32,29 +32,25 @@ static const char *TAG = "XPT2046";
 #define XPT2046_Z_THRESHOLD     400
 #endif
 typedef struct {
-    spi_device_handle_t spi_dev;
     esp_lcd_touch_config_t config;
-    xpt2046_calibration_t calibration;
-    uint16_t x;
-    uint16_t y;
-    bool pressed;
+    uint16_t x_min;
+    uint16_t y_min;
+    uint16_t x_max;
+    uint16_t y_max;
+    uint16_t threshhold;
 } xpt2046_touch_t;
 
-static uint16_t xpt2046_transfer16(spi_device_handle_t spi, uint8_t cmd)
+static esp_err_t xpt2046_transfer16(esp_lcd_panel_io_handle_t io, uint8_t cmd, int16_t* out_result)
 {
-    uint8_t tx_data[3] = {cmd, 0x00, 0x00};
-    uint8_t rx_data[3] = {0};
-    
-    spi_transaction_t trans = {
-        .length = 24,  /* 3 bytes = 24 bits */
-        .tx_buffer = tx_data,
-        .rx_buffer = rx_data,
-    };
-    
-    spi_device_transmit(spi, &trans);
-    
+    uint8_t rx_data[2] = {0};
+    esp_err_t ret = esp_lcd_panel_io_rx_param(io,cmd,rx_data,sizeof(rx_data));
+    if(ret!=ESP_OK) {
+        return ret;
+    }
+    if(out_result==NULL) { return ESP_OK; }
     /* XPT2046 returns 12-bit data: MSB in byte[1] bits[7:0], LSB in byte[2] bits[7:4] */
-    return ((rx_data[1] << 8) | rx_data[2]) >> 3;
+    *out_result = ((rx_data[0] << 8) | rx_data[1]) >> 3;
+    return ESP_OK;
 }
 
 static int16_t besttwoavg(int16_t x, int16_t y, int16_t z)
@@ -73,101 +69,91 @@ static esp_err_t xpt2046_read_data(esp_lcd_touch_handle_t tp)
     xpt2046_touch_t *xpt = (xpt2046_touch_t *)tp->config.user_data;
     int16_t data[6];
     int z;
-    
     /* Read pressure using XPT2046 sequence: Z1 → Z2 → check threshold */
-    int16_t z1 = xpt2046_transfer16(xpt->spi_dev, XPT2046_CMD_Z1);
+    int16_t z1;
+    esp_err_t ret = xpt2046_transfer16(tp->io, XPT2046_CMD_Z1, &z1);
+    if(ret!=ESP_OK) {
+        return ret;
+    }
     z = z1 + 4095;
-    int16_t z2 = xpt2046_transfer16(xpt->spi_dev, XPT2046_CMD_Z2);
+    int16_t z2;
+    ret = xpt2046_transfer16(tp->io, XPT2046_CMD_Z2,&z2);
     z -= z2;
-    
     if (z < 0) z = 0;
-    
-    if (z < XPT2046_Z_THRESHOLD) {
-        xpt->pressed = false;
+    if (z < xpt->threshhold) {
         return ESP_OK;
     }
-    
     /* Perform XPT2046 recommended reading sequence:
      * 1. Dummy X read (first is always noisy)
      * 2. Read Y, X, Y, X, Y, X (3 pairs for averaging)
      * 3. Final Y with power down
      */
-    xpt2046_transfer16(xpt->spi_dev, XPT2046_CMD_X);  /* Dummy */
     
-    data[0] = xpt2046_transfer16(xpt->spi_dev, XPT2046_CMD_Y_PD0);  /* Y1 */
-    data[1] = xpt2046_transfer16(xpt->spi_dev, XPT2046_CMD_X);       /* X1 */
-    data[2] = xpt2046_transfer16(xpt->spi_dev, XPT2046_CMD_Y_PD0);  /* Y2 */
-    data[3] = xpt2046_transfer16(xpt->spi_dev, XPT2046_CMD_X);       /* X2 */
-    data[4] = xpt2046_transfer16(xpt->spi_dev, XPT2046_CMD_Y_PD1);  /* Y3, power down */
-    data[5] = xpt2046_transfer16(xpt->spi_dev, 0);                   /* X3 */
+    xpt2046_transfer16(tp->io, XPT2046_CMD_X, NULL);  /* Dummy */
     
+    ret = xpt2046_transfer16(tp->io, XPT2046_CMD_Y_PD0,&data[0]);  /* Y1 */
+    if(ret!=ESP_OK) {return ret;}
+    ret = xpt2046_transfer16(tp->io, XPT2046_CMD_X,&data[1]);       /* X1 */
+    if(ret!=ESP_OK) {return ret;}
+    ret = xpt2046_transfer16(tp->io, XPT2046_CMD_Y_PD0,&data[2]);  /* Y2 */
+    if(ret!=ESP_OK) {return ret;}
+    ret = xpt2046_transfer16(tp->io, XPT2046_CMD_X,&data[3]);       /* X2 */
+    if(ret!=ESP_OK) {return ret;}
+    ret = xpt2046_transfer16(tp->io, XPT2046_CMD_Y_PD1,&data[4]);  /* Y3, power down */
+    if(ret!=ESP_OK) {return ret;}
+    ret = xpt2046_transfer16(tp->io, 0,&data[5]);                   /* X3 */
+    if(ret!=ESP_OK) {return ret;}
     /* Average using best two of three measurements */
     int16_t x_raw = besttwoavg(data[1], data[3], data[5]);
     int16_t y_raw = besttwoavg(data[0], data[2], data[4]);
-    
-    /* Apply calibration */
+     /* Apply calibration */
     int32_t x_cal = x_raw;
     int32_t y_cal = y_raw;
     
-    #ifdef CONFIG_LCD_TOUCH_XPT2046_ENABLE_CALIBRATION
-    if (xpt->calibration.x_max > xpt->calibration.x_min) {
-        x_cal = ((x_raw - xpt->calibration.x_min) * xpt->config.x_max) / 
-                (xpt->calibration.x_max - xpt->calibration.x_min);
+    if (xpt->x_max > xpt->x_min) {
+        x_cal = ((x_raw - xpt->x_min) * xpt->config.x_max) / 
+                (xpt->x_max - xpt->x_min);
     }
-    if (xpt->calibration.y_max > xpt->calibration.y_min) {
-        y_cal = ((y_raw - xpt->calibration.y_min) * xpt->config.y_max) / 
-                (xpt->calibration.y_max - xpt->calibration.y_min);
+    if (xpt->y_max > xpt->y_min) {
+        y_cal = ((y_raw - xpt->y_min) * xpt->config.y_max) / 
+                (xpt->y_max - xpt->y_min);
     }
-    #else
-    /* Default scaling for typical XPT2046 */
-    x_cal = (x_raw * xpt->config.x_max) / 4095;
-    y_cal = (y_raw * xpt->config.y_max) / 4095;
-    #endif
-    
-    /* Apply swap and invert */
-    if (xpt->config.flags.swap_xy) {
-        int32_t tmp = x_cal;
-        x_cal = y_cal;
-        y_cal = tmp;
-    }
-    
-    if (xpt->config.flags.mirror_x) {
-        x_cal = xpt->config.x_max - x_cal;
-    }
-    
-    if (xpt->config.flags.mirror_y) {
-        y_cal = xpt->config.y_max - y_cal;
-    }
-    
+    portENTER_CRITICAL(&tp->data.lock);
+      
     /* Clamp values */
-    xpt->x = (x_cal < 0) ? 0 : ((x_cal > xpt->config.x_max) ? xpt->config.x_max : x_cal);
-    xpt->y = (y_cal < 0) ? 0 : ((y_cal > xpt->config.y_max) ? xpt->config.y_max : y_cal);
-    xpt->pressed = true;
+    tp->data.points = 1;
+    tp->data.coords[0].x = (x_cal < 0) ? 0 : ((x_cal > xpt->config.x_max) ? xpt->config.x_max : x_cal);
+    tp->data.coords[0].y = (y_cal < 0) ? 0 : ((y_cal > xpt->config.y_max) ? xpt->config.y_max : y_cal);
+    
+    portEXIT_CRITICAL(&tp->data.lock);
     
     return ESP_OK;
 }
 
 static bool xpt2046_get_xy(esp_lcd_touch_handle_t tp, uint16_t *x, uint16_t *y, uint16_t *strength, uint8_t *point_num, uint8_t max_point_num)
 {
-    xpt2046_touch_t *xpt = (xpt2046_touch_t *)tp->config.user_data;
-    
-    /* XPT2046 supports only single touch */
-    if (max_point_num < 1) {
-        return false;
+    portENTER_CRITICAL(&tp->data.lock);
+
+    /* Count of points */
+    *point_num = (tp->data.points > max_point_num ? max_point_num : tp->data.points);
+
+    for (size_t i = 0; i < *point_num; i++)
+    {
+        x[i] = tp->data.coords[i].x;
+        y[i] = tp->data.coords[i].y;
+
+        if (strength)
+        {
+            strength[i] = tp->data.coords[i].strength;
+        }
     }
-    
-    if (!xpt->pressed) {
-        if (point_num) *point_num = 0;
-        return false;
-    }
-    
-    /* Return coordinates */
-    if (x) x[0] = xpt->x;
-    if (y) y[0] = xpt->y;
-    if (strength) strength[0] = 50;  /* XPT2046 doesn't provide precise pressure */
-    if (point_num) *point_num = 1;
-    
-    return true;
+
+    /* Invalidate */
+    tp->data.points = 0;
+
+    portEXIT_CRITICAL(&tp->data.lock);
+
+    return (*point_num > 0);
 }
 
 static esp_err_t xpt2046_del(esp_lcd_touch_handle_t tp)
@@ -176,23 +162,18 @@ static esp_err_t xpt2046_del(esp_lcd_touch_handle_t tp)
     
     /* Free resources */
     if (xpt) {
-        if (xpt->spi_dev) {
-            spi_bus_remove_device(xpt->spi_dev);
-        }
-        free(xpt);
+         free(xpt);
     }
     
     return ESP_OK;
 }
 
-esp_err_t esp_lcd_touch_new_spi_xpt2046(const xpt2046_spi_config_t *spi_config,
-                                         const esp_lcd_touch_config_t *touch_config,
-                                         esp_lcd_touch_handle_t *out_touch)
+esp_err_t esp_lcd_touch_new_xpt2046(const esp_lcd_panel_io_handle_t io, const esp_lcd_touch_config_t *config, esp_lcd_touch_handle_t *out_touch)
 {
-    ESP_RETURN_ON_FALSE(spi_config != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid SPI config");
-    ESP_RETURN_ON_FALSE(touch_config != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid touch config");
+    ESP_RETURN_ON_FALSE(io != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid io handle");
+    ESP_RETURN_ON_FALSE(config != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid touch config");
     ESP_RETURN_ON_FALSE(out_touch != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid output handle");
-    
+    esp_err_t ret;
     /* Allocate touch handle */
     esp_lcd_touch_handle_t touch = calloc(1, sizeof(esp_lcd_touch_t));
     ESP_RETURN_ON_FALSE(touch != NULL, ESP_ERR_NO_MEM, TAG, "No memory for touch handle");
@@ -204,76 +185,59 @@ esp_err_t esp_lcd_touch_new_spi_xpt2046(const xpt2046_spi_config_t *spi_config,
         ESP_LOGE(TAG, "No memory for XPT2046 data");
         return ESP_ERR_NO_MEM;
     }
-    
-    /* Add SPI device to bus */
-    spi_device_interface_config_t dev_cfg = {
-        .mode = 0,  /* SPI mode 0 */
-        .clock_speed_hz = spi_config->spi_freq_hz > 0 ? spi_config->spi_freq_hz : 2000000,  /* 2MHz default */
-        .spics_io_num = spi_config->cs_gpio_num,
-        .queue_size = 1,
-        .flags = SPI_DEVICE_NO_DUMMY,
-    };
-    
-    esp_err_t ret = spi_bus_add_device(spi_config->spi_host, &dev_cfg, &xpt->spi_dev);
-    if (ret != ESP_OK) {
-        free(xpt);
-        free(touch);
-        ESP_LOGE(TAG, "Failed to add SPI device: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    
     /* Initialize XPT2046 data */
-    memcpy(&xpt->config, touch_config, sizeof(esp_lcd_touch_config_t));
-    xpt->pressed = false;
-    
-    /* Default calibration from ESP32-2432S028 (CYD) Arduino example */
-    xpt->calibration.x_min = 200;
-    xpt->calibration.x_max = 3700;
-    xpt->calibration.y_min = 240;
-    xpt->calibration.y_max = 3800;
+    memcpy(&xpt->config, config, sizeof(esp_lcd_touch_config_t));
+    if(config->driver_data==NULL) {
+        /* Default calibration from ESP32-2432S028 (CYD) Arduino example */
+        xpt->x_min = 200;
+        xpt->x_max = 3700;
+        xpt->y_min = 240;
+        xpt->y_max = 3800;
+        xpt->threshhold = XPT2046_Z_THRESHOLD;
+    } else {
+        esp_lcd_touch_xtp2046_config_t* drv = (esp_lcd_touch_xtp2046_config_t*)config->driver_data;
+        xpt->x_min = drv->x_min;
+        xpt->y_min = drv->y_min;
+        xpt->x_max = drv->x_max;
+        xpt->y_max = drv->y_max;
+        xpt->threshhold = drv->threshhold;
+    }
+    touch->data.lock.owner = portMUX_FREE_VAL;
     
     /* Configure interrupt pin if provided */
-    if (touch_config->int_gpio_num != GPIO_NUM_NC) {
-        const gpio_config_t io_conf = {
-            .pin_bit_mask = (1ULL << touch_config->int_gpio_num),
+    if (config->int_gpio_num != GPIO_NUM_NC)
+    {
+        const gpio_config_t int_gpio_config = {
             .mode = GPIO_MODE_INPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,  /* Input-only GPIO can't use internal pull-up */
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,  /* Polling mode for now */
-        };
-        ret = gpio_config(&io_conf);
+            .intr_type = (config->levels.interrupt ? GPIO_INTR_POSEDGE : GPIO_INTR_NEGEDGE),
+            .pin_bit_mask = BIT64(config->int_gpio_num)};
+        ret = gpio_config(&int_gpio_config);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to configure IRQ GPIO %d (input-only?): %s", 
-                     touch_config->int_gpio_num, esp_err_to_name(ret));
+                     config->int_gpio_num, esp_err_to_name(ret));
+        }
+
+        /* Register interrupt callback */
+        if (config->interrupt_callback)
+        {
+            esp_lcd_touch_register_interrupt_callback(touch, config->interrupt_callback);
         }
     }
     
     /* Fill touch handle */
-    touch->config = *touch_config;
+    touch->io = io;
+    touch->config = *config;
     touch->config.user_data = xpt;
     touch->read_data = xpt2046_read_data;
     touch->get_xy = xpt2046_get_xy;
+    touch->get_mirror_x = NULL;
+    touch->get_mirror_y = NULL;
+    touch->get_swap_xy = NULL;
     touch->del = xpt2046_del;
     
     *out_touch = touch;
     
-    ESP_LOGI(TAG, "XPT2046 touch initialized, version: 1.0.0");
-    
-    return ESP_OK;
-}
-
-esp_err_t esp_lcd_touch_xpt2046_set_calibration(esp_lcd_touch_handle_t touch,
-                                                 const xpt2046_calibration_t *calibration)
-{
-    ESP_RETURN_ON_FALSE(touch != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid touch handle");
-    ESP_RETURN_ON_FALSE(calibration != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid calibration");
-    
-    xpt2046_touch_t *xpt = (xpt2046_touch_t *)touch->config.user_data;
-    memcpy(&xpt->calibration, calibration, sizeof(xpt2046_calibration_t));
-    
-    ESP_LOGI(TAG, "Calibration set: X[%d:%d], Y[%d:%d]",
-             calibration->x_min, calibration->x_max,
-             calibration->y_min, calibration->y_max);
+    ESP_LOGI(TAG, "XPT2046 touch initialized, version: 0.2.0");
     
     return ESP_OK;
 }
